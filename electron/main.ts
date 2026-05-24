@@ -1,5 +1,6 @@
-import { app, BrowserWindow, ipcMain, Menu, protocol, net } from 'electron'
+import { app, BrowserWindow, ipcMain, Menu, protocol } from 'electron'
 import path from 'path'
+import fs from 'fs'
 
 // ★ 修复白屏：注册自定义协议绕过 file:// 下 ES Module 限制
 protocol.registerSchemesAsPrivileged([
@@ -80,6 +81,9 @@ function createWindow() {
     mainWindow.loadURL('app://./dist/index.html')
   }
 
+  // Debug: auto-open DevTools on startup
+  mainWindow.webContents.openDevTools()
+
   mainWindow.once('ready-to-show', () => {
     mainWindow?.show()
   })
@@ -105,21 +109,39 @@ ipcMain.handle('search-global', async (_event, query: string) => {
 })
 
 app.whenReady().then(() => {
-  // ★ 注册 app:// 协议文件处理器
+  // ★ 修复：使用 fs.readFileSync（ASAR-aware）替代 net.fetch（不识别 ASAR）
   protocol.handle('app', (request) => {
     const url = new URL(request.url)
-    // 解码路径，移除开头的 '/'
     let filePath = decodeURIComponent(url.pathname)
-    // 处理 '.' 开头的路径 (如 app://./dist/index.html)
+    // 处理 app://./dist/index.html 这类路径
     if (filePath.startsWith('/./')) filePath = filePath.substring(2)
-    else if (filePath.startsWith('/')) filePath = filePath
 
     const fullPath = path.join(__dirname, '..', filePath)
+    const ext = path.extname(fullPath).toLowerCase()
+
+    const mimeTypes: Record<string, string> = {
+      '.js': 'application/javascript',
+      '.css': 'text/css',
+      '.html': 'text/html',
+      '.png': 'image/png',
+      '.svg': 'image/svg+xml',
+      '.json': 'application/json',
+      '.ico': 'image/x-icon',
+      '.woff': 'font/woff',
+      '.woff2': 'font/woff2',
+    }
+
     try {
-      return net.fetch(`file://${fullPath.replace(/\\/g, '/')}`)
+      const data = fs.readFileSync(fullPath)
+      return new Response(data, {
+        headers: { 'Content-Type': mimeTypes[ext] || 'application/octet-stream' }
+      })
     } catch {
-      // SPA fallback: 所有未匹配路径返回 index.html
-      return net.fetch(`file://${path.join(__dirname, '../dist/index.html').replace(/\\/g, '/')}`)
+      // SPA fallback: 未匹配路径返回 index.html（支持 Vue Router history 模式）
+      const data = fs.readFileSync(path.join(__dirname, '../dist/index.html'))
+      return new Response(data, {
+        headers: { 'Content-Type': 'text/html' }
+      })
     }
   })
   createWindow()
