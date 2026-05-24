@@ -113,8 +113,10 @@ app.whenReady().then(() => {
   protocol.handle('app', (request) => {
     const url = new URL(request.url)
     let filePath = decodeURIComponent(url.pathname)
-    // 处理 app://./dist/index.html 这类路径
-    if (filePath.startsWith('/./')) filePath = filePath.substring(2)
+    // ★ Windows 兼容：path.join 会把 / 开头路径当作 C:\ 根路径
+    // URL 解析 app://./dist/index.html → pathname = /dist/index.html
+    if (filePath.startsWith('/')) filePath = filePath.substring(1)
+    if (filePath.startsWith('./')) filePath = filePath.substring(2)
 
     const fullPath = path.join(__dirname, '..', filePath)
     const ext = path.extname(fullPath).toLowerCase()
