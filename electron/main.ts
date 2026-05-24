@@ -1,5 +1,10 @@
-import { app, BrowserWindow, ipcMain, Menu } from 'electron'
+import { app, BrowserWindow, ipcMain, Menu, protocol, net } from 'electron'
 import path from 'path'
+
+// ★ 修复白屏：注册自定义协议绕过 file:// 下 ES Module 限制
+protocol.registerSchemesAsPrivileged([
+  { scheme: 'app', privileges: { standard: true, secure: true, supportFetchAPI: true, corsEnabled: false } }
+])
 
 let mainWindow: BrowserWindow | null = null
 
@@ -71,7 +76,8 @@ function createWindow() {
   if (isDev) {
     mainWindow.loadURL(process.env.VITE_DEV_SERVER_URL!)
   } else {
-    mainWindow.loadFile(path.join(__dirname, '../dist/index.html'))
+    // ★ 修复：使用 app:// 协议替代 file://，使 ES Module 正常加载
+    mainWindow.loadURL('app://./dist/index.html')
   }
 
   mainWindow.once('ready-to-show', () => {
@@ -98,7 +104,26 @@ ipcMain.handle('search-global', async (_event, query: string) => {
   return { query }
 })
 
-app.whenReady().then(createWindow)
+app.whenReady().then(() => {
+  // ★ 注册 app:// 协议文件处理器
+  protocol.handle('app', (request) => {
+    const url = new URL(request.url)
+    // 解码路径，移除开头的 '/'
+    let filePath = decodeURIComponent(url.pathname)
+    // 处理 '.' 开头的路径 (如 app://./dist/index.html)
+    if (filePath.startsWith('/./')) filePath = filePath.substring(2)
+    else if (filePath.startsWith('/')) filePath = filePath
+
+    const fullPath = path.join(__dirname, '..', filePath)
+    try {
+      return net.fetch(`file://${fullPath.replace(/\\/g, '/')}`)
+    } catch {
+      // SPA fallback: 所有未匹配路径返回 index.html
+      return net.fetch(`file://${path.join(__dirname, '../dist/index.html').replace(/\\/g, '/')}`)
+    }
+  })
+  createWindow()
+})
 
 app.on('window-all-closed', () => {
   app.quit()
