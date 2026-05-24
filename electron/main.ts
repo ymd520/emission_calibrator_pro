@@ -1,15 +1,78 @@
-import { app, BrowserWindow, ipcMain, Menu, protocol } from 'electron'
+import { app, BrowserWindow, ipcMain, Menu } from 'electron'
 import path from 'path'
 import fs from 'fs'
-
-// ★ 修复白屏：注册自定义协议绕过 file:// 下 ES Module 限制
-protocol.registerSchemesAsPrivileged([
-  { scheme: 'app', privileges: { standard: true, secure: true, supportFetchAPI: true, corsEnabled: false } }
-])
+import { createServer } from 'http'
 
 let mainWindow: BrowserWindow | null = null
+let httpServer: ReturnType<typeof createServer> | null = null
+let serverPort: number | null = null
 
-function createWindow() {
+/**
+ * ★ 启动本地 HTTP 服务器（生产模式）
+ * 避免 ES Module 在 file:// 协议下被 Chromium 阻止加载
+ * 以及自定义 app:// 协议的各种兼容性问题
+ */
+function startLocalServer(): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const distPath = path.join(__dirname, '..', 'dist')
+
+    const mimeTypes: Record<string, string> = {
+      '.js': 'application/javascript',
+      '.css': 'text/css',
+      '.html': 'text/html',
+      '.png': 'image/png',
+      '.svg': 'image/svg+xml',
+      '.json': 'application/json',
+      '.ico': 'image/x-icon',
+      '.woff': 'font/woff',
+      '.woff2': 'font/woff2',
+      '.map': 'application/json',
+    }
+
+    httpServer = createServer((req, res) => {
+      let reqPath = req.url || '/'
+      // SPA: 根路径或无后缀路径都返回 index.html
+      if (reqPath === '/' || !path.extname(reqPath.split('?')[0])) {
+        reqPath = '/index.html'
+      }
+
+      const filePath = path.join(distPath, reqPath)
+      const ext = path.extname(filePath).toLowerCase()
+
+      try {
+        const data = fs.readFileSync(filePath)
+        res.writeHead(200, {
+          'Content-Type': mimeTypes[ext] || 'application/octet-stream',
+          'Access-Control-Allow-Origin': '*'
+        })
+        res.end(data)
+      } catch {
+        // SPA fallback: 所有未匹配路径返回 index.html
+        try {
+          const data = fs.readFileSync(path.join(distPath, 'index.html'))
+          res.writeHead(200, { 'Content-Type': 'text/html' })
+          res.end(data)
+        } catch {
+          res.writeHead(500)
+          res.end('Error loading application')
+        }
+      }
+    })
+
+    httpServer.listen(0, '127.0.0.1', () => {
+      const addr = httpServer!.address()
+      if (addr && typeof addr === 'object') {
+        resolve(addr.port)
+      } else {
+        reject(new Error('Failed to get server port'))
+      }
+    })
+
+    httpServer.on('error', reject)
+  })
+}
+
+function createWindow(port?: number | null) {
   const isDev = process.env.VITE_DEV_SERVER_URL
 
   mainWindow = new BrowserWindow({
@@ -74,14 +137,14 @@ function createWindow() {
   ])
   Menu.setApplicationMenu(menu)
 
+  // ★ 加载页面
   if (isDev) {
     mainWindow.loadURL(process.env.VITE_DEV_SERVER_URL!)
-  } else {
-    // ★ 修复：使用 app:// 协议替代 file://，使 ES Module 正常加载
-    mainWindow.loadURL('app://./dist/index.html')
+  } else if (port) {
+    mainWindow.loadURL(`http://127.0.0.1:${port}/index.html`)
   }
 
-  // Debug: auto-open DevTools on startup
+  // Debug: 启动时自动打开 DevTools
   mainWindow.webContents.openDevTools()
 
   mainWindow.once('ready-to-show', () => {
@@ -94,67 +157,37 @@ function createWindow() {
 }
 
 // IPC 处理
-ipcMain.handle('get-app-version', () => {
-  return app.getVersion()
-})
+ipcMain.handle('get-app-version', () => app.getVersion())
+ipcMain.handle('get-platform', () => process.platform)
+ipcMain.handle('search-global', async (_event, query: string) => ({ query }))
 
-ipcMain.handle('get-platform', () => {
-  return process.platform
-})
-
-// 全局搜索
-ipcMain.handle('search-global', async (_event, query: string) => {
-  // 搜索逻辑在渲染进程中处理
-  return { query }
-})
-
-app.whenReady().then(() => {
-  // ★ 修复：使用 fs.readFileSync（ASAR-aware）替代 net.fetch（不识别 ASAR）
-  protocol.handle('app', (request) => {
-    const url = new URL(request.url)
-    let filePath = decodeURIComponent(url.pathname)
-    // ★ Windows 兼容：path.join 会把 / 开头路径当作 C:\ 根路径
-    // URL 解析 app://./dist/index.html → pathname = /dist/index.html
-    if (filePath.startsWith('/')) filePath = filePath.substring(1)
-    if (filePath.startsWith('./')) filePath = filePath.substring(2)
-
-    const fullPath = path.join(__dirname, '..', filePath)
-    const ext = path.extname(fullPath).toLowerCase()
-
-    const mimeTypes: Record<string, string> = {
-      '.js': 'application/javascript',
-      '.css': 'text/css',
-      '.html': 'text/html',
-      '.png': 'image/png',
-      '.svg': 'image/svg+xml',
-      '.json': 'application/json',
-      '.ico': 'image/x-icon',
-      '.woff': 'font/woff',
-      '.woff2': 'font/woff2',
-    }
-
-    try {
-      const data = fs.readFileSync(fullPath)
-      return new Response(data, {
-        headers: { 'Content-Type': mimeTypes[ext] || 'application/octet-stream' }
-      })
-    } catch {
-      // SPA fallback: 未匹配路径返回 index.html（支持 Vue Router history 模式）
-      const data = fs.readFileSync(path.join(__dirname, '../dist/index.html'))
-      return new Response(data, {
-        headers: { 'Content-Type': 'text/html' }
-      })
-    }
-  })
-  createWindow()
+// ★ 启动流程
+app.whenReady().then(async () => {
+  if (!process.env.VITE_DEV_SERVER_URL) {
+    // 生产模式：先启动服务器，再创建窗口
+    serverPort = await startLocalServer()
+    console.log(`[EmissionCalibrator] HTTP server started on 127.0.0.1:${serverPort}`)
+  }
+  createWindow(serverPort)
 })
 
 app.on('window-all-closed', () => {
+  if (httpServer) {
+    httpServer.close()
+    httpServer = null
+  }
   app.quit()
 })
 
 app.on('activate', () => {
   if (BrowserWindow.getAllWindows().length === 0) {
-    createWindow()
+    if (!process.env.VITE_DEV_SERVER_URL && !httpServer) {
+      app.whenReady().then(async () => {
+        serverPort = await startLocalServer()
+        createWindow(serverPort)
+      })
+    } else {
+      createWindow(serverPort)
+    }
   }
 })
